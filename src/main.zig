@@ -1342,6 +1342,15 @@ fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) 
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
+    // Clear screen and scrollback before replaying terminal state.
+    // This ensures the CUP cursor position (which is screen-relative, not
+    // buffer-relative) works correctly when scrollback is restored.
+    // ESC[3J = clear scrollback, ESC[H = home cursor, ESC[2J = clear screen
+    builder.writer.writeAll("\x1b[3J\x1b[H\x1b[2J") catch |err| {
+        std.log.warn("failed to write clear sequence err={s}", .{@errorName(err)});
+        return null;
+    };
+
     var term_formatter = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
     term_formatter.content = .{ .selection = null };
     term_formatter.extra = .{
