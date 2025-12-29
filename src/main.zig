@@ -371,6 +371,27 @@ pub fn main() !void {
         daemon.socket_path = try getSocketPath(alloc, cfg.socket_dir, session_name);
         std.log.info("socket path={s}", .{daemon.socket_path});
         return run(&daemon, command_args.items);
+    } else if (std.mem.eql(u8, cmd, "send") or std.mem.eql(u8, cmd, "s")) {
+        const session_name = args.next() orelse {
+            return error.SessionNameRequired;
+        };
+
+        if (args.next() != null) return error.UnknownArg;
+
+        const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+        var daemon = Daemon{
+            .running = true,
+            .cfg = &cfg,
+            .alloc = alloc,
+            .clients = clients,
+            .session_name = session_name,
+            .socket_path = undefined,
+            .pid = undefined,
+            .command = null,
+        };
+        daemon.socket_path = try getSocketPath(alloc, cfg.socket_dir, session_name);
+        std.log.info("socket path={s}", .{daemon.socket_path});
+        return sendCmd(alloc, &daemon);
     } else {
         return help();
     }
@@ -392,6 +413,7 @@ fn help() !void {
         \\Commands:
         \\  [a]ttach <name> [command...]  Attach to session, creating session if needed
         \\  [r]un <name> [command...]     Send command without attaching, creating session if needed
+        \\  [s]end <name>                 Send raw stdin bytes to existing session without attaching
         \\  [d]etach                      Detach all clients from current session (ctrl+\ for current client)
         \\  [l]ist                        List active sessions
         \\  [k]ill <name>                 Kill a session and all attached clients
@@ -827,6 +849,65 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
     }
 
     return error.NoAckReceived;
+}
+
+fn sendCmd(alloc: std.mem.Allocator, daemon: *Daemon) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+
+    const stdin_fd = posix.STDIN_FILENO;
+
+    // `send` is strict: it never creates sessions. Fail fast if the session
+    // socket doesn't exist (or is stale).
+    var dir = try std.fs.openDirAbsolute(daemon.cfg.socket_dir, .{});
+    defer dir.close();
+    const exists = sessionExists(dir, daemon.session_name) catch return error.SessionDoesNotExist;
+    if (!exists) return error.SessionDoesNotExist;
+
+    const probe_result = probeSession(alloc, daemon.socket_path) catch |err| {
+        std.log.err("session not ready: {s}", .{@errorName(err)});
+        return error.SessionNotReady;
+    };
+    defer posix.close(probe_result.fd);
+
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+
+    var sent_count: usize = 0;
+    var ack_count: usize = 0;
+
+    while (true) {
+        var tmp: [4096]u8 = undefined;
+        const n = posix.read(stdin_fd, &tmp) catch |err| {
+            if (err == error.WouldBlock) return error.InputRequired;
+            return err;
+        };
+        if (n == 0) break;
+
+        try ipc.send(probe_result.fd, .Run, tmp[0..n]);
+        sent_count += 1;
+    }
+
+    if (sent_count == 0) return error.InputRequired;
+
+    var poll_fds = [_]posix.pollfd{.{ .fd = probe_result.fd, .events = posix.POLL.IN, .revents = 0 }};
+    while (ack_count < sent_count) {
+        const poll_result = posix.poll(&poll_fds, 5000) catch return error.PollFailed;
+        if (poll_result == 0) {
+            std.log.err("timeout waiting for ack", .{});
+            return error.Timeout;
+        }
+
+        const n = sb.read(probe_result.fd) catch return error.ReadFailed;
+        if (n == 0) return error.ConnectionClosed;
+
+        while (sb.next()) |msg| {
+            if (msg.header.tag == .Ack) ack_count += 1;
+        }
+    }
+
+    try w.interface.print("sent\n", .{});
+    try w.interface.flush();
 }
 
 fn clientLoop(_: *Cfg, client_sock_fd: i32) !void {
