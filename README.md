@@ -56,6 +56,7 @@ Usage: zmx <command> [args]
 Commands:
   [a]ttach <name> [command...]  Attach to session, creating session if needed
   [r]un <name> [command...]     Send command without attaching, creating session if needed
+  [s]end <name>                 Send raw stdin bytes to existing session without attaching
   [d]etach                      Detach all clients from current session  (ctrl+\ for current client)
   [l]ist                        List active sessions
   [k]ill <name>                 Kill a session and all attached clients
@@ -75,6 +76,7 @@ zmx attach mux dvtm         # run a multiplexer inside zmx
 zmx run dev cat README.md   # run the command without attaching to the session
 zmx r dev cat CHANGELOG.md  # alias
 echo "ls -lah" | zmx r dev  # use stdin to run the command
+printf 'Hello\\r' | zmx send dev  # send raw bytes (\\r is Enter)
 ```
 
 ## shell prompt
