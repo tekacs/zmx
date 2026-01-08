@@ -13,10 +13,12 @@ pub const Tag = enum(u8) {
     History = 8,
     Run = 9,
     Ack = 10,
+    Snapshot = 11,
+    InfoText = 12,
 };
 
 pub const Header = packed struct {
-    tag: Tag,
+    tag: u8,
     len: u32,
 };
 
@@ -38,7 +40,7 @@ pub fn expectedLength(data: []const u8) ?usize {
 
 pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
     const header = Header{
-        .tag = tag,
+        .tag = @intFromEnum(tag),
         .len = @intCast(data.len),
     };
     const header_bytes = std.mem.asBytes(&header);
@@ -50,7 +52,7 @@ pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
 
 pub fn appendMessage(alloc: std.mem.Allocator, list: *std.ArrayList(u8), tag: Tag, data: []const u8) !void {
     const header = Header{
-        .tag = tag,
+        .tag = @intFromEnum(tag),
         .len = @intCast(data.len),
     };
     try list.appendSlice(alloc, std.mem.asBytes(&header));

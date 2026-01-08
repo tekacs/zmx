@@ -61,6 +61,8 @@ Commands:
   [l]ist                        List active sessions
   [k]ill <name>                 Kill a session and all attached clients
   [hi]story <name>              Output session scrollback as plain text
+  [sn]apshot <name>             Output a VT/ANSI snapshot of the current screen state
+  [i]nfo <name>                 Output daemon info (pid, clients, versions)
   [v]ersion                     Show version information
   [h]elp                        Show this help message
 ```

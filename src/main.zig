@@ -249,11 +249,11 @@ const Daemon = struct {
 
     pub fn handleInfo(self: *Daemon, client: *Client) !void {
         const clients_len = self.clients.items.len - 1;
-        const info = ipc.Info{
+        const info_msg = ipc.Info{
             .clients_len = clients_len,
             .pid = self.pid,
         };
-        try ipc.appendMessage(self.alloc, &client.write_buf, .Info, std.mem.asBytes(&info));
+        try ipc.appendMessage(self.alloc, &client.write_buf, .Info, std.mem.asBytes(&info_msg));
         client.has_pending_output = true;
     }
 
@@ -266,6 +266,28 @@ const Daemon = struct {
             try ipc.appendMessage(self.alloc, &client.write_buf, .History, "");
             client.has_pending_output = true;
         }
+    }
+
+    pub fn handleSnapshot(self: *Daemon, client: *Client, term: *ghostty_vt.Terminal) !void {
+        if (serializeTerminalState(self.alloc, term)) |output| {
+            defer self.alloc.free(output);
+            try ipc.appendMessage(self.alloc, &client.write_buf, .Snapshot, output);
+            client.has_pending_output = true;
+        } else {
+            try ipc.appendMessage(self.alloc, &client.write_buf, .Snapshot, "");
+            client.has_pending_output = true;
+        }
+    }
+
+    pub fn handleInfoText(self: *Daemon, client: *Client) !void {
+        const clients_len = self.clients.items.len - 1;
+        const body = try std.fmt.allocPrint(self.alloc,
+            "zmx_version={s}\nghostty_vt_version={s}\npid={d}\nclients={d}\n",
+            .{ version, ghostty_version, self.pid, clients_len },
+        );
+        defer self.alloc.free(body);
+        try ipc.appendMessage(self.alloc, &client.write_buf, .InfoText, body);
+        client.has_pending_output = true;
     }
 
     pub fn handleRun(self: *Daemon, client: *Client, pty_fd: i32, payload: []const u8) !void {
@@ -317,6 +339,16 @@ pub fn main() !void {
             return error.SessionNameRequired;
         };
         return history(&cfg, session_name);
+    } else if (std.mem.eql(u8, cmd, "snapshot") or std.mem.eql(u8, cmd, "sn")) {
+        const session_name = args.next() orelse {
+            return error.SessionNameRequired;
+        };
+        return snapshot(&cfg, session_name);
+    } else if (std.mem.eql(u8, cmd, "info") or std.mem.eql(u8, cmd, "i")) {
+        const session_name = args.next() orelse {
+            return error.SessionNameRequired;
+        };
+        return info(&cfg, session_name);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         const session_name = args.next() orelse {
             return error.SessionNameRequired;
@@ -418,6 +450,8 @@ fn help() !void {
         \\  [l]ist                        List active sessions
         \\  [k]ill <name>                 Kill a session and all attached clients
         \\  [hi]story <name>              Output session scrollback as plain text
+        \\  [sn]apshot <name>             Output a VT/ANSI snapshot of the current screen state
+        \\  [i]nfo <name>                 Output daemon info (pid, clients, versions)
         \\  [v]ersion                     Show version information
         \\  [h]elp                        Show this help message
         \\
@@ -619,7 +653,121 @@ fn history(cfg: *Cfg, session_name: []const u8) !void {
         if (n == 0) return;
 
         while (sb.next()) |msg| {
-            if (msg.header.tag == .History) {
+            const tag = std.meta.intToEnum(ipc.Tag, msg.header.tag) catch {
+                std.log.warn("unknown tag={d}", .{msg.header.tag});
+                continue;
+            };
+            if (tag == .History) {
+                _ = posix.write(posix.STDOUT_FILENO, msg.payload) catch return;
+                return;
+            }
+        }
+    }
+}
+
+fn snapshot(cfg: *Cfg, session_name: []const u8) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const exists = try sessionExists(dir, session_name);
+    if (!exists) {
+        std.log.err("session does not exist session_name={s}", .{session_name});
+        return;
+    }
+
+    const socket_path = try getSocketPath(alloc, cfg.socket_dir, session_name);
+    defer alloc.free(socket_path);
+    const result = probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        cleanupStaleSocket(dir, session_name);
+        return;
+    };
+    defer posix.close(result.fd);
+
+    ipc.send(result.fd, .Snapshot, "") catch |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => return,
+        else => return err,
+    };
+
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+
+    while (true) {
+        var poll_fds = [_]posix.pollfd{.{ .fd = result.fd, .events = posix.POLL.IN, .revents = 0 }};
+        const poll_result = posix.poll(&poll_fds, 5000) catch return;
+        if (poll_result == 0) {
+            std.log.err("timeout waiting for snapshot response", .{});
+            return;
+        }
+
+        const n = sb.read(result.fd) catch return;
+        if (n == 0) return;
+
+        while (sb.next()) |msg| {
+            const tag = std.meta.intToEnum(ipc.Tag, msg.header.tag) catch {
+                std.log.warn("unknown tag={d}", .{msg.header.tag});
+                continue;
+            };
+            if (tag == .Snapshot) {
+                _ = posix.write(posix.STDOUT_FILENO, msg.payload) catch return;
+                return;
+            }
+        }
+    }
+}
+
+fn info(cfg: *Cfg, session_name: []const u8) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const exists = try sessionExists(dir, session_name);
+    if (!exists) {
+        std.log.err("session does not exist session_name={s}", .{session_name});
+        return;
+    }
+
+    const socket_path = try getSocketPath(alloc, cfg.socket_dir, session_name);
+    defer alloc.free(socket_path);
+    const result = probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        cleanupStaleSocket(dir, session_name);
+        return;
+    };
+    defer posix.close(result.fd);
+
+    ipc.send(result.fd, .InfoText, "") catch |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => return,
+        else => return err,
+    };
+
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+
+    while (true) {
+        var poll_fds = [_]posix.pollfd{.{ .fd = result.fd, .events = posix.POLL.IN, .revents = 0 }};
+        const poll_result = posix.poll(&poll_fds, 5000) catch return;
+        if (poll_result == 0) {
+            std.log.err("timeout waiting for info response", .{});
+            return;
+        }
+
+        const n = sb.read(result.fd) catch return;
+        if (n == 0) return;
+
+        while (sb.next()) |msg| {
+            const tag = std.meta.intToEnum(ipc.Tag, msg.header.tag) catch {
+                std.log.warn("unknown tag={d}", .{msg.header.tag});
+                continue;
+            };
+            if (tag == .InfoText) {
                 _ = posix.write(posix.STDOUT_FILENO, msg.payload) catch return;
                 return;
             }
@@ -841,7 +989,11 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
     if (n == 0) return error.ConnectionClosed;
 
     while (sb.next()) |msg| {
-        if (msg.header.tag == .Ack) {
+        const tag = std.meta.intToEnum(ipc.Tag, msg.header.tag) catch {
+            std.log.warn("unknown tag={d}", .{msg.header.tag});
+            continue;
+        };
+        if (tag == .Ack) {
             try w.interface.print("command sent\n", .{});
             try w.interface.flush();
             return;
@@ -902,7 +1054,11 @@ fn sendCmd(alloc: std.mem.Allocator, daemon: *Daemon) !void {
         if (n == 0) return error.ConnectionClosed;
 
         while (sb.next()) |msg| {
-            if (msg.header.tag == .Ack) ack_count += 1;
+            const tag = std.meta.intToEnum(ipc.Tag, msg.header.tag) catch {
+                std.log.warn("unknown tag={d}", .{msg.header.tag});
+                continue;
+            };
+            if (tag == .Ack) ack_count += 1;
         }
     }
 
@@ -1021,13 +1177,12 @@ fn clientLoop(_: *Cfg, client_sock_fd: i32) !void {
             }
 
             while (read_buf.next()) |msg| {
-                switch (msg.header.tag) {
-                    .Output => {
-                        if (msg.payload.len > 0) {
-                            try stdout_buf.appendSlice(alloc, msg.payload);
-                        }
-                    },
-                    else => {},
+                const tag = std.meta.intToEnum(ipc.Tag, msg.header.tag) catch {
+                    std.log.warn("unknown tag={d}", .{msg.header.tag});
+                    continue;
+                };
+                if (tag == .Output and msg.payload.len > 0) {
+                    try stdout_buf.appendSlice(alloc, msg.payload);
                 }
             }
         }
@@ -1190,7 +1345,11 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 }
 
                 while (client.read_buf.next()) |msg| {
-                    switch (msg.header.tag) {
+                    const tag = std.meta.intToEnum(ipc.Tag, msg.header.tag) catch {
+                        std.log.warn("unknown tag={d}", .{msg.header.tag});
+                        continue;
+                    };
+                    switch (tag) {
                         .Input => try daemon.handleInput(pty_fd, msg.payload),
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
                         .Resize => try daemon.handleResize(pty_fd, &term, msg.payload),
@@ -1208,7 +1367,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                             break :clients_loop;
                         },
                         .Info => try daemon.handleInfo(client),
+                        .InfoText => try daemon.handleInfoText(client),
                         .History => try daemon.handleHistory(client, &term),
+                        .Snapshot => try daemon.handleSnapshot(client, &term),
                         .Run => try daemon.handleRun(client, pty_fd, msg.payload),
                         .Output, .Ack => {},
                     }
@@ -1334,13 +1495,15 @@ fn probeSession(alloc: std.mem.Allocator, socket_path: []const u8) SessionProbeE
     if (n == 0) return error.Unexpected;
 
     while (sb.next()) |msg| {
-        if (msg.header.tag == .Info) {
-            if (msg.payload.len == @sizeOf(ipc.Info)) {
-                return .{
-                    .fd = fd,
-                    .info = std.mem.bytesToValue(ipc.Info, msg.payload[0..@sizeOf(ipc.Info)]),
-                };
-            }
+        const tag = std.meta.intToEnum(ipc.Tag, msg.header.tag) catch {
+            std.log.warn("unknown tag={d}", .{msg.header.tag});
+            continue;
+        };
+        if (tag == .Info and msg.payload.len == @sizeOf(ipc.Info)) {
+            return .{
+                .fd = fd,
+                .info = std.mem.bytesToValue(ipc.Info, msg.payload[0..@sizeOf(ipc.Info)]),
+            };
         }
     }
     return error.Unexpected;
